@@ -1,0 +1,87 @@
+name: wager-ledger
+
+# 3 réplicas do serviço (portas 3001..3003) sobre o MESMO PostgreSQL e as MESMAS filas: a solução precisa estar
+# correta com várias instâncias. Cada réplica roda API + consumidor SQS + publisher da outbox + worker de pendências.
+
+x-app-env: &app-env
+  NODE_ENV: production
+  PORT: "3000"
+  LOG_LEVEL: info
+  DATABASE_URL: postgres://postgres:postgres@postgres:5432/wager
+  DB_POOL_MAX: "20"
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_ENDPOINT: http://localstack:4566
+  SQS_TRANSACTIONS_QUEUE: wager-transactions.fifo
+  SQS_TRANSACTIONS_DLQ: wager-transactions-dlq.fifo
+  SQS_EVENTS_QUEUE: wager-events.fifo
+  SQS_AUTO_CREATE: "true"
+
+x-app: &app
+  build: .
+  image: wager-ledger-service:local
+  restart: unless-stopped
+  stop_grace_period: 45s # SIGTERM: drena mensagens em andamento antes de encerrar
+  depends_on:
+    postgres: { condition: service_healthy }
+    localstack: { condition: service_healthy }
+    migrate: { condition: service_completed_successfully }
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: wager
+    command: ["postgres", "-c", "max_connections=200"]
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d wager"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    # Fixada em uma versão que roda sem token. Qualquer emulador SQS compatível serve (ex.: MiniStack, moto):
+    # basta apontar SQS_ENDPOINT. Sobrescreva com LOCALSTACK_IMAGE=...
+    image: ${LOCALSTACK_IMAGE:-localstack/localstack:3.8.1}
+    environment:
+      SERVICES: sqs
+      DEBUG: "0"
+    ports: ["4566:4566"]
+    volumes:
+      - ./docker/localstack/init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -Eq '\"sqs\": \"(running|available)\"'"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    <<: *app
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+    environment: *app-env
+    command: ["bun", "run", "migration:up"]
+
+  app-1:
+    <<: *app
+    environment: { <<: *app-env, INSTANCE_ID: app-1 }
+    ports: ["3001:3000"]
+
+  app-2:
+    <<: *app
+    environment: { <<: *app-env, INSTANCE_ID: app-2 }
+    ports: ["3002:3000"]
+
+  app-3:
+    <<: *app
+    environment: { <<: *app-env, INSTANCE_ID: app-3 }
+    ports: ["3003:3000"]
+
+volumes:
+  pgdata:
